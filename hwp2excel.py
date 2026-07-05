@@ -319,6 +319,27 @@ def extract_tables_via_olefile(hwp_path):
     return tables
 
 
+def convert_cell_value(text):
+    """숫자로 보이는 텍스트는 숫자로 변환 (SUM 등 수식이 동작하도록).
+
+    "4,991" → 4991, "18.6" → 18.6, "18.6%" → 0.186(+퍼센트 서식).
+    단위가 붙은 값("6,666명")이나 복합 텍스트는 그대로 둔다.
+    반환: (값, 숫자서식 또는 None)
+    """
+    import re
+
+    t = text.strip()
+    m = re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[+-]?\d+(?:\.\d+)?", t)
+    if m:
+        num = t.replace(",", "")
+        return (float(num) if "." in num else int(num)), None
+    m = re.fullmatch(r"([+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[+-]?\d+(?:\.\d+)?)%", t)
+    if m:
+        num = m.group(1).replace(",", "")
+        return float(num) / 100, "0.0%"
+    return text, None
+
+
 def tables_to_excel(tables, output_path, progress_cb=None):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -336,7 +357,10 @@ def tables_to_excel(tables, output_path, progress_cb=None):
 
         for r_idx, row in enumerate(tbl["rows"], start=1):
             for c_idx, cell_val in enumerate(row, start=1):
-                cell = ws.cell(row=r_idx, column=c_idx, value=cell_val)
+                value, num_format = convert_cell_value(cell_val)
+                cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                if num_format:
+                    cell.number_format = num_format
                 cell.border = border
                 cell.alignment = Alignment(
                     wrap_text=True, vertical="center"
