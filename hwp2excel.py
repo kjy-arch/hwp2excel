@@ -1,6 +1,6 @@
 """
 HWP 표 → Excel 변환기
-한글 파일의 표를 엑셀 시트로 변환 (시트마다 표 1개)
+한글 파일(.hwp/.hwpx)의 표를 엑셀 시트로 변환 (시트마다 표 1개)
 """
 
 import sys
@@ -12,10 +12,92 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 
+def extract_tables_via_hwpx(hwpx_path):
+    """
+    HWPX(ZIP+XML)에서 표를 직접 파싱. 한글 설치 불필요.
+    셀 병합은 좌상단 셀에 값이 들어가고 나머지는 빈 칸.
+    """
+    import re
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    NS = "{http://www.hancom.co.kr/hwpml/2011/paragraph}"
+
+    tables = []
+    table_index = 0
+
+    with zipfile.ZipFile(hwpx_path) as zf:
+        section_names = sorted(
+            n for n in zf.namelist()
+            if re.fullmatch(r"Contents/section\d+\.xml", n)
+        )
+        if not section_names:
+            raise ValueError("올바른 HWPX 파일이 아닙니다.")
+
+        for name in section_names:
+            root = ET.fromstring(zf.read(name))
+            for tbl in root.iter(f"{NS}tbl"):
+                row_count = int(tbl.get("rowCnt", "0"))
+                col_count = int(tbl.get("colCnt", "0"))
+                if row_count <= 0 or col_count <= 0:
+                    continue
+
+                grid = [["" for _ in range(col_count)] for _ in range(row_count)]
+                for tr_idx, tr in enumerate(tbl.findall(f"{NS}tr")):
+                    for tc_idx, tc in enumerate(tr.findall(f"{NS}tc")):
+                        addr = tc.find(f"{NS}cellAddr")
+                        if addr is not None:
+                            r = int(addr.get("rowAddr", tr_idx))
+                            c = int(addr.get("colAddr", tc_idx))
+                        else:
+                            r, c = tr_idx, tc_idx
+                        paras = [
+                            "".join(t.text or "" for t in p.iter(f"{NS}t"))
+                            for p in tc.findall(f"{NS}subList/{NS}p")
+                        ]
+                        text = "\n".join(paras).strip()
+                        if 0 <= r < row_count and 0 <= c < col_count:
+                            grid[r][c] = text
+
+                table_index += 1
+                tables.append({
+                    "index": table_index,
+                    "rows": grid,
+                    "row_count": row_count,
+                    "col_count": col_count,
+                })
+
+    return tables
+
+
 def extract_tables_via_com(hwp_path):
     """한글 프로그램 COM 자동화로 표 추출 (가장 정확)"""
+    import re
     import win32com.client
     import pythoncom
+
+    def get_selected_text(hwp):
+        # 선택 영역 텍스트를 스캔 방식으로 읽기 (클립보드 미사용)
+        hwp.InitScan(0, 0xFF)  # 0xFF = 선택 영역만 스캔
+        parts = []
+        while True:
+            state, text = hwp.GetText()
+            if state in (0, 1):
+                break
+            parts.append(text)
+        hwp.ReleaseScan()
+        return "".join(parts).strip()
+
+    def get_cell_addr(hwp):
+        # KeyIndicator 마지막 요소가 "(A1)..." 형태의 셀 주소
+        indicator = hwp.KeyIndicator()[-1]
+        m = re.match(r"\(([A-Z]+)(\d+)\)", str(indicator))
+        if not m:
+            return None
+        col = 0
+        for ch in m.group(1):
+            col = col * 26 + (ord(ch) - ord("A") + 1)
+        return int(m.group(2)), col  # (row, col) 1-based
 
     pythoncom.CoInitialize()
     hwp = None
@@ -23,7 +105,11 @@ def extract_tables_via_com(hwp_path):
     try:
         hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
         hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
-        hwp.Open(hwp_path, "HWP", "forceopen:true")
+        # 포맷 ""(자동 감지): hwp/hwpx 모두 확장자에 맞춰 연다
+        if not hwp.Open(hwp_path, "", "forceopen:true"):
+            raise RuntimeError(
+                "한글에서 파일을 열지 못했습니다.\n"
+                "파일 형식을 확인하거나 직접 파싱 방식을 사용해보세요.")
 
         hwp.SetPos(0, 0, 0)
         ctrl = hwp.HeadCtrl
@@ -32,20 +118,35 @@ def extract_tables_via_com(hwp_path):
         while ctrl is not None:
             if ctrl.CtrlID == "tbl":
                 table_index += 1
-                rows_data = []
-                row_count = ctrl.Properties.Item("NumRows").Value
-                col_count = ctrl.Properties.Item("NumCols").Value
 
-                for r in range(row_count):
-                    row = []
-                    for c in range(col_count):
-                        try:
-                            cell = ctrl.GetCell(r, c)
-                            text = cell.Text.strip() if cell else ""
-                        except Exception:
-                            text = ""
-                        row.append(text)
-                    rows_data.append(row)
+                # 표 첫 셀로 진입한 뒤 셀을 차례로 순회하며 텍스트 수집
+                hwp.SetPosBySet(ctrl.GetAnchorPos(0))
+                hwp.FindCtrl()
+                hwp.HAction.Run("ShapeObjTableSelCell")
+
+                cells = {}  # (row, col) -> text, 1-based
+                while True:
+                    addr = get_cell_addr(hwp)
+                    hwp.HAction.Run("TableCellBlock")
+                    text = get_selected_text(hwp)
+                    if addr:
+                        cells[addr] = text
+                    pos = hwp.GetPos()
+                    hwp.HAction.Run("TableRightCell")
+                    if hwp.GetPos() == pos:
+                        break  # 마지막 셀
+                hwp.HAction.Run("Cancel")
+
+                if not cells:
+                    ctrl = ctrl.Next
+                    continue
+
+                row_count = max(r for r, _ in cells)
+                col_count = max(c for _, c in cells)
+                rows_data = [
+                    [cells.get((r, c), "") for c in range(1, col_count + 1)]
+                    for r in range(1, row_count + 1)
+                ]
 
                 tables.append({
                     "index": table_index,
@@ -74,9 +175,10 @@ def extract_tables_via_olefile(hwp_path):
     import zlib
     import struct
 
-    TAG_PARA_HEADER = 66
-    TAG_TABLE = 76
-    TAG_CELL_TEXT = 73
+    # HWP 5.0 스펙: HWPTAG_BEGIN(16) + 오프셋
+    TAG_PARA_TEXT = 67    # HWPTAG_PARA_TEXT
+    TAG_LIST_HEADER = 72  # HWPTAG_LIST_HEADER (셀마다 1개)
+    TAG_TABLE = 77        # HWPTAG_TABLE
 
     def iter_records(data):
         i = 0
@@ -108,53 +210,108 @@ def extract_tables_via_olefile(hwp_path):
     tables = []
     table_index = 0
 
-    section_num = 1
+    def decode_para_text(payload):
+        # PARA_TEXT는 UTF-16LE. 인라인 컨트롤 문자(코드 < 32)는
+        # 확장 컨트롤(8워드) 여부에 따라 건너뛴다.
+        EXTENDED = {1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23}
+        chars = []
+        i = 0
+        n = len(payload) // 2
+        while i < n:
+            code = struct.unpack_from("<H", payload, i * 2)[0]
+            if code in EXTENDED:
+                i += 8  # 컨트롤 코드 + 부가정보 7워드
+                continue
+            if code < 32:
+                if code in (10, 13):
+                    chars.append("\n")
+                i += 1
+                continue
+            chars.append(chr(code))
+            i += 1
+        return "".join(chars).strip()
+
+    def emit_table(cell_map, row_count, col_count):
+        # cell_map: (row, col) -> text. 병합 셀은 좌상단만 채워진다.
+        nonlocal table_index
+        if row_count <= 0 or col_count <= 0 or not cell_map:
+            return
+        table_index += 1
+        tables.append({
+            "index": table_index,
+            "rows": [
+                [cell_map.get((r, c), "") for c in range(col_count)]
+                for r in range(row_count)
+            ],
+            "row_count": row_count,
+            "col_count": col_count,
+        })
+
+    section_num = 0
     while True:
-        stream_name = f"BodyText/Section{section_num:04d}"
+        stream_name = f"BodyText/Section{section_num}"
         if not ole.exists(stream_name):
             break
-        raw = ole.openstream(stream_name).read()
-        data = read_section(raw)
+        data = read_section(ole.openstream(stream_name).read())
 
+        # 상태 머신: TABLE 레코드가 표를 열고, 같은 레벨의 LIST_HEADER가
+        # 셀 시작(페이로드 오프셋 8/10에 열/행 주소), 그보다 깊은
+        # PARA_TEXT가 셀 내용. 레벨이 표보다 얕아지면 표 범위를 벗어난 것.
         in_table = False
-        current_rows = []
-        current_row = []
-        expected_cols = 0
+        table_level = 0
+        cur_addr = None   # 현재 열린 셀의 (row, col)
+        cell_texts = []
+        cell_map = {}
         row_count = 0
         col_count = 0
 
+        def close_cell():
+            nonlocal cur_addr
+            if cur_addr is not None:
+                cell_map[cur_addr] = "\n".join(cell_texts).strip()
+                cur_addr = None
+            cell_texts.clear()
+
         for tag_id, level, payload in iter_records(data):
-            if tag_id == TAG_TABLE:
-                if len(payload) >= 16:
-                    row_count = struct.unpack_from("<H", payload, 8)[0]
-                    col_count = struct.unpack_from("<H", payload, 10)[0]
-                in_table = True
-                current_rows = []
-                current_row = []
-                expected_cols = col_count
-            elif tag_id == 77 and in_table:
+            if tag_id == TAG_TABLE and (not in_table or level <= table_level):
+                # 새 표 시작 — 표 레코드: 속성 UINT32 + 행 UINT16 + 열 UINT16
+                if len(payload) >= 8:
+                    close_cell()
+                    if in_table:
+                        emit_table(cell_map, row_count, col_count)
+                    row_count = struct.unpack_from("<H", payload, 4)[0]
+                    col_count = struct.unpack_from("<H", payload, 6)[0]
+                    in_table = True
+                    table_level = level
+                    cell_map = {}
                 continue
-            elif tag_id == 67 and in_table:
+
+            if not in_table:
+                continue
+
+            if tag_id == TAG_LIST_HEADER and level == table_level:
+                close_cell()
+                if len(payload) >= 12:
+                    col = struct.unpack_from("<H", payload, 8)[0]
+                    row = struct.unpack_from("<H", payload, 10)[0]
+                    if row < row_count and col < col_count:
+                        cur_addr = (row, col)
+            elif tag_id == TAG_PARA_TEXT and cur_addr is not None \
+                    and level > table_level:
                 try:
-                    text = payload.decode("utf-16-le", errors="replace").strip()
-                    text = text.replace("\x00", "").strip()
+                    cell_texts.append(decode_para_text(payload))
                 except Exception:
-                    text = ""
-                current_row.append(text)
+                    pass
+            elif level < table_level:
+                # 표 범위 밖으로 나옴 — 표 확정
+                close_cell()
+                emit_table(cell_map, row_count, col_count)
+                in_table = False
 
-                if len(current_row) >= max(expected_cols, 1):
-                    current_rows.append(current_row[:])
-                    current_row = []
-
-                    if len(current_rows) >= row_count and row_count > 0:
-                        table_index += 1
-                        tables.append({
-                            "index": table_index,
-                            "rows": current_rows,
-                            "row_count": row_count,
-                            "col_count": col_count,
-                        })
-                        in_table = False
+        # 스트림 끝에서 열린 표 마무리
+        if in_table:
+            close_cell()
+            emit_table(cell_map, row_count, col_count)
 
         section_num += 1
 
@@ -316,7 +473,12 @@ class App(tk.Tk):
                 method = self.method_var.get()
                 self.status_var.set("표 추출 중...")
 
-                if method == "com":
+                ext = os.path.splitext(hwp)[1].lower()
+                if ext == ".hwpx":
+                    # HWPX는 ZIP+XML 포맷 — 직접 파싱이 가장 정확하고
+                    # 한글 설치도 필요 없다
+                    tables = extract_tables_via_hwpx(hwp)
+                elif method == "com":
                     tables = extract_tables_via_com(hwp)
                 else:
                     tables = extract_tables_via_olefile(hwp)
