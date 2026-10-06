@@ -6,6 +6,7 @@ HWP 표 → Excel 변환기
 import sys
 import os
 import re
+import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
@@ -570,6 +571,10 @@ def tables_to_excel(tables, output_path, progress_cb=None):
             for c_idx, cell_val in enumerate(row, start=1):
                 value, num_format = convert_cell_value(cell_val)
                 cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                if cell.data_type == "f":
+                    # openpyxl은 "="로 시작하는 문자열을 수식으로 저장한다.
+                    # 한글 표의 글자는 수식이 아니므로 문자열로 고정한다.
+                    cell.data_type = "s"
                 if num_format:
                     cell.number_format = num_format
                 cell.border = border
@@ -791,10 +796,19 @@ class App(tk.Tk):
         self.progress["value"] = 0
         self.status_var.set("변환 중...")
 
+        # Tk는 스레드에 안전하지 않다. 작업 스레드는 화면을 직접 건드리지
+        # 않고, 메인 스레드에서 실행할 함수를 큐에 넣기만 한다.
+        method = self.method_var.get()
+        events = queue.Queue()
+        ui = events.put
+
+        def finish():
+            self.btn.config(state="normal")
+            self.progress["value"] = 0
+
         def run():
             try:
-                method = self.method_var.get()
-                self.status_var.set("표 추출 중...")
+                ui(lambda: self.status_var.set("표 추출 중..."))
 
                 ext = os.path.splitext(hwp)[1].lower()
                 if ext == ".hwpx" and page_range is None:
@@ -807,41 +821,64 @@ class App(tk.Tk):
                     tables = extract_tables_via_olefile(hwp)
 
                 if not tables:
-                    messagebox.showwarning(
-                        "알림", "표를 찾을 수 없습니다.\n파싱 방식을 바꿔 시도해보세요.")
+                    ui(lambda: messagebox.showwarning(
+                        "알림", "표를 찾을 수 없습니다.\n파싱 방식을 바꿔 시도해보세요."))
                     return
 
                 if page_range:
                     first, last = page_range
                     tables = filter_tables_by_page(tables, first, last)
                     if not tables:
-                        messagebox.showwarning(
-                            "알림", f"{first}~{last}쪽에는 표가 없습니다.")
+                        ui(lambda: messagebox.showwarning(
+                            "알림", f"{first}~{last}쪽에는 표가 없습니다."))
                         return
 
-                self.status_var.set(f"표 {len(tables)}개 발견. 엑셀 생성 중...")
-                self.progress["maximum"] = len(tables)
+                count = len(tables)
+
+                def start_writing():
+                    self.status_var.set(f"표 {count}개 발견. 엑셀 생성 중...")
+                    self.progress["maximum"] = count
+                ui(start_writing)
 
                 def on_progress(done, total):
-                    self.progress["value"] = done
-                    self.status_var.set(f"변환 중... {done}/{total}")
-                    self.update_idletasks()
+                    def show():
+                        self.progress["value"] = done
+                        self.status_var.set(f"변환 중... {done}/{total}")
+                    ui(show)
 
                 tables_to_excel(tables, out, progress_cb=on_progress)
 
-                messagebox.showinfo(
-                    "완료",
-                    f"변환 완료!\n\n표 {len(tables)}개 → {len(tables)}개 시트\n\n저장 위치:\n{out}")
-
-                self.status_var.set(f"완료! 표 {len(tables)}개 변환됨")
+                def done():
+                    messagebox.showinfo(
+                        "완료",
+                        f"변환 완료!\n\n표 {count}개 → {count}개 시트\n\n저장 위치:\n{out}")
+                    self.status_var.set(f"완료! 표 {count}개 변환됨")
+                ui(done)
             except Exception as e:
-                messagebox.showerror("오류", f"변환 실패:\n{e}")
-                self.status_var.set("오류 발생")
+                msg = str(e)
+
+                def failed():
+                    messagebox.showerror("오류", f"변환 실패:\n{msg}")
+                    self.status_var.set("오류 발생")
+                ui(failed)
             finally:
-                self.btn.config(state="normal")
-                self.progress["value"] = 0
+                ui(finish)
+                ui(None)  # 끝 표시 — 큐 폴링 중단
 
         threading.Thread(target=run, daemon=True).start()
+        self._drain(events)
+
+    def _drain(self, events):
+        """작업 스레드가 넣은 함수를 메인 스레드에서 실행한다."""
+        while True:
+            try:
+                fn = events.get_nowait()
+            except queue.Empty:
+                break
+            if fn is None:
+                return
+            fn()
+        self.after(50, self._drain, events)
 
 
 if __name__ == "__main__":

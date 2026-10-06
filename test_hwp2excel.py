@@ -5,11 +5,15 @@
 
 import os
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
+from unittest import mock
 
 import openpyxl
 
+import hwp2excel
 from hwp2excel import (
     App,
     convert_cell_value,
@@ -179,6 +183,16 @@ class TablesToExcelTest(unittest.TestCase):
         ws = self.sheet(tables)
         self.assertEqual([str(r) for r in ws.merged_cells.ranges], ["A1:C1"])
 
+    def test_text_starting_with_equals_is_not_a_formula(self):
+        tables = [{
+            "index": 1, "row_count": 1, "col_count": 2,
+            "rows": [["=1+1", "= 합계"]], "merges": [],
+        }]
+        ws = self.sheet(tables)
+        self.assertEqual(ws["A1"].value, "=1+1")
+        self.assertEqual(ws["A1"].data_type, "s")
+        self.assertEqual(ws["B1"].data_type, "s")
+
     def test_wide_header_does_not_stretch_its_column(self):
         long_text = "아" * 60
         tables = [{
@@ -325,6 +339,80 @@ class PageInputUiTest(unittest.TestCase):
             self.app.last_var.set(last)
             with self.assertRaises(ValueError):
                 self.app._page_range()
+
+
+class ConvertThreadingTest(unittest.TestCase):
+    """변환은 작업 스레드에서, Tk 호출은 모두 메인 스레드에서."""
+
+    def setUp(self):
+        try:
+            self.app = App()
+        except Exception as e:  # 디스플레이 없는 환경
+            self.skipTest(f"Tk를 띄울 수 없음: {e}")
+        self.app.withdraw()
+        self.addCleanup(self.app.destroy)
+
+        fd, self.src = tempfile.mkstemp(suffix=".hwp")
+        os.close(fd)
+        self.addCleanup(os.remove, self.src)
+        self.app.hwp_var.set(self.src)
+        self.app.out_var.set(self.src + ".xlsx")
+        self.app.method_var.set("ole")
+
+    def run_conversion(self, tables):
+        main = threading.current_thread()
+        seen = {}
+
+        def extract(path):
+            seen["extract"] = threading.current_thread()
+            if isinstance(tables, Exception):
+                raise tables
+            return tables
+
+        def to_excel(tbls, out, progress_cb=None):
+            for i in range(len(tbls)):
+                progress_cb(i + 1, len(tbls))
+
+        def dialog(kind):
+            def show(*args, **kwargs):
+                seen[kind] = threading.current_thread()
+            return show
+
+        with mock.patch.object(hwp2excel, "extract_tables_via_olefile",
+                               extract), \
+                mock.patch.object(hwp2excel, "tables_to_excel", to_excel), \
+                mock.patch.object(hwp2excel.messagebox, "showinfo",
+                                  dialog("info")), \
+                mock.patch.object(hwp2excel.messagebox, "showwarning",
+                                  dialog("warning")), \
+                mock.patch.object(hwp2excel.messagebox, "showerror",
+                                  dialog("error")):
+            self.app._start()
+            deadline = time.time() + 5
+            while str(self.app.btn["state"]) == "disabled":
+                self.assertLess(time.time(), deadline, "변환이 끝나지 않음")
+                self.app.update()
+                time.sleep(0.01)
+        return main, seen
+
+    def test_extraction_runs_off_the_main_thread(self):
+        main, seen = self.run_conversion([{"index": 1}])
+        self.assertIsNot(seen["extract"], main)
+
+    def test_dialogs_are_shown_on_the_main_thread(self):
+        main, seen = self.run_conversion([{"index": 1}, {"index": 2}])
+        self.assertIs(seen["info"], main)
+        self.assertEqual(self.app.status_var.get(), "완료! 표 2개 변환됨")
+        self.assertEqual(self.app.progress["value"], 0)
+
+    def test_warning_when_no_tables(self):
+        main, seen = self.run_conversion([])
+        self.assertIs(seen["warning"], main)
+
+    def test_error_is_reported_on_the_main_thread(self):
+        main, seen = self.run_conversion(RuntimeError("깨진 파일"))
+        self.assertIs(seen["error"], main)
+        self.assertEqual(self.app.status_var.get(), "오류 발생")
 
 
 class ConvertCellValueTest(unittest.TestCase):
