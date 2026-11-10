@@ -5,3 +5,7 @@ dist/
 .venv/
 venv/
 *.xlsx
+
+.env
+.env.*
+!.env.example
